@@ -1,28 +1,42 @@
 #!/usr/bin/env python3
 """
-kernel_driver_analyze.py  v2.0
+kernel_driver_analyze.py  v3.0
 Windows kernel driver vulnerability analysis engine.
 
-Improvements over v1:
-  ✓ Function boundary detection (9000+ functions, per-function analysis)
-  ✓ Register taint tracking (x64 calling convention → tracks user-data flow)
-  ✓ Double-fetch / TOCTOU detection (same IRP field read multiple times)
-  ✓ CFG / binary mitigation checks (ASLR, DEP, CFG, SEHOP, stack cookies)
-  ✓ __try/__except block detection (fault handling presence)
-  ✓ Null-deref after alloc detection (alloc without null-check before deref)
-  ✓ Arbitrary write primitive detection ([computed-reg] = user-value)
-  ✓ ExFreePool / use-after-free pattern detection
-  ✓ Large stack frame near user-input (potential stack overflow)
-  ✓ IOCTL jump-table detection (catches range-based switches missed by v1)
-  ✓ Per-function IOCTL handler scoping
-  ✓ CVSS-like severity scoring for each finding
-  ✓ JSON report output (machine-readable)
-  ✓ ANSI colour output for terminal
-  ✓ False-positive reduction (constant-size alloc cleared, etc.)
+Usage:
+    python3 kernel_driver_analyze.py <driver.sys> [options]
+
+Options:
+    --force          Re-generate disassembly even if cached copy exists
+    --out <file>     JSON output path (default: <driver>_findings.json)
+    --color          Force ANSI colour output even when not a tty
+
+New in v3.0 (over v2.0):
+  ✓ Fully self-contained — pass ONLY the .sys file, everything else is automatic
+  ✓ Auto-disassembly: detects objdump/r2, generates + caches disasm file
+  ✓ Smart cache: reuses existing disasm if driver mtime unchanged (--force overrides)
+  ✓ Live progress bar during disassembly generation
+  ✓ Multi-tool fallback: objdump → radare2 → error with install hint
+  ✓ Auto-named outputs: <driver>_disasm.txt, <driver>_findings.json
+  ✓ Disasm integrity check: validates line count before proceeding
+  ✓ PE architecture guard: rejects non-PE32+/non-x64 files early
+
+Retained from v2.0:
+  ✓ Function boundary detection (per-function analysis)
+  ✓ Register taint tracking (x64 calling convention)
+  ✓ Double-fetch / TOCTOU detection
+  ✓ CFG / binary mitigation checks
+  ✓ __try/__except block detection
+  ✓ Null-deref after alloc, UAF, arbitrary write detection
+  ✓ Large stack frame analysis
+  ✓ IOCTL jump-table + METHOD_NEITHER detection
+  ✓ CVSS-like severity scoring
+  ✓ JSON + ANSI terminal report
 """
 
-import struct, sys, re, json, os, time
+import struct, sys, re, json, os, time, subprocess, shutil, hashlib, threading
 from collections import defaultdict
+from pathlib import Path
 
 # ── ANSI colours ──────────────────────────────────────────────────────────
 USE_COLOR = sys.stdout.isatty() or "--color" in sys.argv
@@ -34,17 +48,140 @@ CYAN   = lambda s: C("96",s)
 BOLD   = lambda s: C("1", s)
 DIM    = lambda s: C("2", s)
 
-SYS_FILE   = sys.argv[1] if len(sys.argv) > 1 else "dxgkrnl.sys"
-DISASM_FILE = sys.argv[2] if len(sys.argv) > 2 else "full_disasm.txt"
-JSON_OUT    = sys.argv[3] if len(sys.argv) > 3 else "findings.json"
+# ── Argument parsing ───────────────────────────────────────────────────────
+def usage():
+    print(f"Usage: {sys.argv[0]} <driver.sys> [--force] [--out findings.json] [--color]")
+    sys.exit(1)
+
+args = sys.argv[1:]
+if not args or args[0].startswith("--"): usage()
+
+SYS_FILE   = args[0]
+FORCE_DISASM = "--force" in args
+JSON_OUT   = None
+for i, a in enumerate(args):
+    if a == "--out" and i+1 < len(args):
+        JSON_OUT = args[i+1]
+
+stem       = Path(SYS_FILE).stem          # e.g. "dxgkrnl"
+DISASM_FILE = f"{stem}_disasm.txt"
+if JSON_OUT is None:
+    JSON_OUT = f"{stem}_findings.json"
+
+if not os.path.isfile(SYS_FILE):
+    print(RED(f"[!] File not found: {SYS_FILE}")); sys.exit(1)
 
 print(BOLD(f"\n{'='*70}"))
-print(BOLD(f"  Windows Kernel Driver Analyzer v2.0"))
-print(BOLD(f"  Target : {SYS_FILE}"))
+print(BOLD(f"  Windows Kernel Driver Analyzer v3.0"))
+print(BOLD(f"  Target  : {SYS_FILE}"))
+print(BOLD(f"  Disasm  : {DISASM_FILE}"))
+print(BOLD(f"  Report  : {JSON_OUT}"))
 print(BOLD(f"{'='*70}\n"))
 
 DATA = open(SYS_FILE, "rb").read()
 t0   = time.time()
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 0 — DISASSEMBLY GENERATION (auto, cached)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _find_disassembler():
+    """Return (tool, mode) or raise RuntimeError."""
+    if shutil.which("objdump"):
+        return "objdump"
+    if shutil.which("r2"):
+        return "r2"
+    raise RuntimeError(
+        "No disassembler found. Install one:\n"
+        "  apt install binutils       # for objdump (recommended)\n"
+        "  apt install radare2        # for r2"
+    )
+
+def _disasm_cmd(tool, sys_file, out_file):
+    """Return shell command list for the detected tool."""
+    if tool == "objdump":
+        return ["objdump", "-d", "-M", "intel", sys_file]
+    if tool == "r2":
+        # r2 headless: analyse + print all disasm
+        return ["r2", "-q", "-c", "aaa; pdf @@ fcn.*", sys_file]
+    raise ValueError(tool)
+
+def _progress_monitor(out_file, done_event):
+    """Background thread: print live line count while disasm runs."""
+    t = time.time()
+    while not done_event.is_set():
+        time.sleep(2)
+        if os.path.exists(out_file):
+            try:
+                lines = sum(1 for _ in open(out_file))
+                elapsed = time.time() - t
+                print(f"\r    {lines:,} lines written  ({elapsed:.0f}s)...", end="", flush=True)
+            except: pass
+    print()   # newline after progress
+
+def _need_regen():
+    """True if disasm file is missing, empty, or driver is newer than cache."""
+    if FORCE_DISASM:
+        return True
+    if not os.path.exists(DISASM_FILE):
+        return True
+    if os.path.getsize(DISASM_FILE) < 1024:
+        return True
+    # regenerate if driver file is newer than cached disasm
+    if os.path.getmtime(SYS_FILE) > os.path.getmtime(DISASM_FILE):
+        print(f"  {YELLOW('!')} Driver newer than cached disasm — regenerating")
+        return True
+    return False
+
+def generate_disassembly():
+    if not _need_regen():
+        cached_lines = sum(1 for _ in open(DISASM_FILE))
+        print(f"  {GREEN('✓')} Using cached disassembly: {DISASM_FILE} ({cached_lines:,} lines)")
+        print(f"    {DIM('(pass --force to regenerate)')}")
+        return
+
+    try:
+        tool = _find_disassembler()
+    except RuntimeError as e:
+        print(RED(f"[!] {e}")); sys.exit(1)
+
+    print(f"  {CYAN('→')} Generating disassembly with {BOLD(tool)} ...")
+    print(f"    {DIM('This may take 30–120s for large drivers. Progress below:')}")
+
+    cmd = _disasm_cmd(tool, SYS_FILE, DISASM_FILE)
+
+    done = threading.Event()
+    monitor = threading.Thread(target=_progress_monitor,
+                               args=(DISASM_FILE, done), daemon=True)
+    monitor.start()
+
+    t_start = time.time()
+    try:
+        with open(DISASM_FILE, "w") as fout, \
+             open(os.devnull, "w") as devnull:
+            proc = subprocess.run(cmd, stdout=fout, stderr=devnull)
+    except Exception as e:
+        done.set(); print(RED(f"\n[!] Disassembly failed: {e}")); sys.exit(1)
+    finally:
+        done.set()
+
+    elapsed = time.time() - t_start
+
+    # Integrity check
+    if not os.path.exists(DISASM_FILE) or os.path.getsize(DISASM_FILE) < 1024:
+        print(RED(f"[!] Disassembly output too small — something went wrong."))
+        print(f"    Try running manually: {' '.join(cmd)} > {DISASM_FILE}")
+        sys.exit(1)
+
+    line_count = sum(1 for _ in open(DISASM_FILE))
+    if line_count < 100:
+        print(RED(f"[!] Only {line_count} lines generated — likely wrong format or stripped binary."))
+        sys.exit(1)
+
+    print(f"  {GREEN('✓')} Disassembly complete: {line_count:,} lines in {elapsed:.1f}s → {DISASM_FILE}")
+
+print("[*] Checking disassembly ...")
+generate_disassembly()
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — PE PARSING
@@ -154,7 +291,7 @@ def find_str(pattern):
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — DISASSEMBLY INDEX + FUNCTION MAP
 # ════════════════════════════════════════════════════════════════════════════
-print(f"[*] Loading disassembly from {DISASM_FILE} ...")
+print(f"[*] Loading disassembly ({DISASM_FILE}) ...")
 DISASM = open(DISASM_FILE).readlines()
 print(f"    {len(DISASM):,} lines")
 
@@ -175,7 +312,7 @@ for i, line in enumerate(DISASM):
     s = line.strip()
     is_int3 = s.endswith("int3") or s.endswith("\tcc")
     if in_int3 and not is_int3 and s and not s.startswith("Disassembly") \
-            and not s.startswith(SYS_FILE):
+            and not s.startswith(stem) and not s.startswith(SYS_FILE):
         p = s.split(":")
         try: FUNC_STARTS.append((int(p[0].strip(), 16), i))
         except: pass
@@ -1029,5 +1166,6 @@ with open(JSON_OUT, "w") as jf:
 elapsed = time.time()-t0
 print(BOLD(f"\n{'═'*70}"))
 print(BOLD(f"  COMPLETE in {elapsed:.1f}s  |  {len(FINDINGS)} findings  |  {len(FUNC_STARTS):,} functions analyzed"))
+print(f"  Disassembly → {DISASM_FILE}")
 print(f"  JSON report → {JSON_OUT}")
 print(BOLD(f"{'═'*70}\n"))
